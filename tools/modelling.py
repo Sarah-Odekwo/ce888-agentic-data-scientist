@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import os
 import pandas as pd
@@ -7,12 +7,17 @@ import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import (OneHotEncoder, OrdinalEncoder, StandardScaler, RobustScaler,)
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.model_selection import train_test_split
 
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier,
+    ExtraTreesClassifier,
+)
 from sklearn.svm import SVC
 
 from sklearn.metrics import (
@@ -23,87 +28,255 @@ from sklearn.metrics import (
     recall_score,
 )
 
+# optional: imbalanced-learn for oversampling (replan strategy)
+try:
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from imblearn.over_sampling import RandomOverSampler
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
+
 
 def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
-    num_cols = profile["feature_types"]["numeric"]
-    cat_cols = profile["feature_types"]["categorical"]
+    """
+    Build a preprocessing pipeline driven by _plan_config in the profile.
 
+    Reads from profile["_plan_config"]:
+        impute_strategy : "mean" | "median"  (default "median")
+        scaler : "standard" | "robust"  (default "standard")
+        high_card_cols : List[str]  -> OrdinalEncoder instead of OneHotEncoder
+        drop_corr_cols : List[str]  -> removed before building transformers
+        feature_selection : "select_k_best" | None
+        k_best : int  (default 30)
+
+    Returns:
+        A ColumnTransformer (no feature selection) or a sklearn Pipeline
+        (ColumnTransformer -> SelectKBest) when feature_selection is set.
+        Both are valid as the "preprocess" step inside train_models().
+    """
+    cfg = profile.get("_plan_config", {})
+
+    # column lists from the profiler
+    num_cols  = list(profile["feature_types"]["numeric"])
+    cat_cols  = list(profile["feature_types"]["categorical"])
+
+    # config values with some safe defaults
+    impute_strategy = cfg.get("impute_strategy", "median")
+    scaler_type = cfg.get("scaler", "standard")
+    high_card_cols = cfg.get("high_card_cols", [])
+    drop_corr_cols = cfg.get("drop_corr_cols", [])
+    feature_selection = cfg.get("feature_selection")
+    k_best = int(cfg.get("k_best") or 30)
+
+    # remove the correlated featured flagged by the planner
+    num_cols  = [c for c in num_cols  if c not in drop_corr_cols]
+    cat_cols  = [c for c in cat_cols  if c not in drop_corr_cols]
+
+    # split the categoricals
+    high_card_active = [c for c in high_card_cols if c in cat_cols]
+    low_card_cols    = [c for c in cat_cols if c not in high_card_active]
+
+    # choose the scaler based on _plan_config
+    # RobustScaler used when data_profiler detected outlier columns so that extreme values do not distort the scaling of the inlier range.
+    scaler = (
+        RobustScaler()
+        if scaler_type == "robust"
+        else StandardScaler(with_mean=True)
+    )
+
+    # numeric transformer
     numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler(with_mean=True)),
+        ("imputer", SimpleImputer(strategy=impute_strategy)),
+        ("scaler",  scaler),
     ])
 
-    # scikit-learn renamed `sparse` -> `sparse_output` (v1.2+). Support both.
+    # low cardinality categorical transformer
     try:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-    categorical_transformer = Pipeline(steps=[
+    low_card_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", ohe),
+        ("onehot",  ohe),
     ])
 
-    return ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, num_cols),
-            ("cat", categorical_transformer, cat_cols),
-        ],
-        remainder="drop",
-    )
+    # high cardinality categorical transformer
+    # OrdinalEncoder avoids the dimensionality explosion that OneHotEncoder
+    high_card_transformer = Pipeline(steps=[
+        ("imputer",  SimpleImputer(strategy="most_frequent")),
+        ("ordinal",  OrdinalEncoder(
+            handle_unknown="use_encoded_value",
+            unknown_value=-1,
+        )),
+    ])
+
+    # assembles the column transformer
+    transformers = []
+    if num_cols:
+        transformers.append(("num", numeric_transformer, num_cols))
+    if low_card_cols:
+        transformers.append(("cat_low", low_card_transformer, low_card_cols))
+    if high_card_active:
+        transformers.append(("cat_high", high_card_transformer, high_card_active))
+
+    if not transformers:
+        # Fallback: passthrough everything
+        transformers.append(("num", numeric_transformer, num_cols or list(
+            profile["feature_types"]["numeric"]
+        )))
+
+    ct = ColumnTransformer(transformers=transformers, remainder="drop")
+
+    # optionally append SelectKBest
+    # Planner activates this when >100 effective features exist, or when the reflector triggers a replan due to noisy/high-spread results.
+    if feature_selection == "select_k_best":
+        return Pipeline(steps=[
+            ("preprocess", ct),
+            ("select",     SelectKBest(f_classif, k=k_best)),
+        ])
+
+    return ct
 
 
 def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, Any]]:
+    """
+    Build the list of model candidates driven by _plan_config.
+
+    Reads from profile["_plan_config"]:
+        handle_imbalance : "class_weight" | "oversample" | None
+            - class_weight="balanced" when "class_weight"
+            - class_weight=None when "oversample" 
+        extra_models : List[str]  — added by reflector on replan
+            supported: "ExtraTreesClassifier"
+        priority_model    : str | None — from memory hint (best past model)
+            - moved to front of candidate list (trained first)
+        prefer_simple_models : bool — set for small datasets (<500 rows)
+            - skips GradientBoosting and SVC
+
+    Returns:
+        List of (name, estimator) tuples with DummyClassifier always first.
+    """
+    cfg = profile.get("_plan_config", {})
     rows = profile["shape"]["rows"]
     cols = profile["shape"]["cols"]
-    imb = float(profile.get("imbalance_ratio") or 1.0)
-    class_weight = "balanced" if imb >= 3.0 else None
 
+    handle_imbalance = cfg.get("handle_imbalance")
+    extra_models = cfg.get("extra_models", [])
+    priority_model = cfg.get("priority_model")
+    prefer_simple = cfg.get("prefer_simple_models", False)
+
+    class_weight = "balanced" if handle_imbalance == "class_weight" else None
+
+    # base candidates
     candidates: List[Tuple[str, Any]] = [
         ("DummyMostFrequent", DummyClassifier(strategy="most_frequent")),
-        ("LogisticRegression", LogisticRegression(max_iter=2000, class_weight=class_weight)),
+        ("LogisticRegression", LogisticRegression(
+            max_iter=2000, class_weight=class_weight, random_state=seed,
+        )),
         ("RandomForest", RandomForestClassifier(
-            n_estimators=300, random_state=seed, n_jobs=-1, class_weight=class_weight
+            n_estimators=300, random_state=seed,
+            n_jobs=-1, class_weight=class_weight,
         )),
     ]
+    
+    if not prefer_simple and rows <= 50_000:
+        candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed,
+        )))
 
-    if rows <= 50000:
-        candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed)))
+    if not prefer_simple and rows <= 20_000 and cols <= 200:
+        candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=True, class_weight=class_weight,
+        )))
 
-    # SVC can be expensive after one-hot; keep for smaller problems
-    if rows <= 20000 and cols <= 200:
-        candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=True, class_weight=class_weight)))
+    # extra models from reflector replan 
+    extra_map: Dict[str, Any] = {
+        "ExtraTreesClassifier": ExtraTreesClassifier(
+            n_estimators=300, random_state=seed,
+            n_jobs=-1, class_weight=class_weight,
+        ),
+    }
+    existing_names = {name for name, _ in candidates}
+    for model_name in extra_models:
+        if model_name in extra_map and model_name not in existing_names:
+            candidates.append((model_name, extra_map[model_name]))
+
+    # prioritise memory hint model 
+    # when memory records a strong past model for this dataset fingerprint, the planner sets priority_model so it trains first. 
+    # if it is not already in the candidate list it is inserted after the dummy baseline.
+    if priority_model and priority_model not in existing_names:
+        if priority_model in extra_map:
+            candidates.insert(1, (priority_model, extra_map[priority_model]))
+
+    # move priority_model to position 1 if already present
+    if priority_model:
+        idx = next(
+            (i for i, (n, _) in enumerate(candidates) if n == priority_model),
+            None,
+        )
+        if idx is not None and idx > 1:
+            candidates.insert(1, candidates.pop(idx))
 
     return candidates
-
 
 def train_models(
     df: pd.DataFrame,
     target: str,
-    preprocessor: ColumnTransformer,
+    preprocessor,
     candidates: List[Tuple[str, Any]],
     seed: int,
     test_size: float,
     output_dir: str,
     verbose: bool = True,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Train all candidate models and return a payload with the best result.
+
+    Parameters: 
+        config : optional _plan_config dict from the profile.
+            When config["handle_imbalance"] == "oversample" AND imbalanced-learn
+            is installed, a RandomOverSampler is inserted into the pipeline
+            between preprocessing and the model so the training set is
+            synthetically balanced.  The resampler is skipped during predict().
+            If imbalanced-learn is not installed, falls back silently (the
+            class_weight strategy set in select_models() still applies).
+    """
+    cfg = config or {}
+
     if target not in df.columns:
-        raise ValueError(f"Target '{target}' not found.")
+        raise ValueError(f"Target column '{target}' not found in DataFrame.")
 
     X = df.drop(columns=[target]).copy()
     y = df[target].copy()
 
-    # Drop missing target rows
+    # drop rows where target is missing
     mask = ~y.isna()
-    X = X.loc[mask]
-    y = y.loc[mask]
+    X, y = X.loc[mask], y.loc[mask]
 
-    # Stratify if possible
-    stratify = y if (y.nunique(dropna=True) > 1 and y.value_counts().min() >= 2) else None
+    stratify = (
+        y if (y.nunique(dropna=True) > 1 and y.value_counts().min() >= 2)
+        else None
+    )
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=stratify
+        X, y,
+        test_size=test_size,
+        random_state=seed,
+        stratify=stratify,
     )
+
+    # Oversampling: only for non-dummy models when imblearn is available
+    use_oversample = (
+        cfg.get("handle_imbalance") == "oversample" and HAS_IMBLEARN
+    )
+    if use_oversample and verbose:
+        print("[Modelling] Oversampling strategy: RandomOverSampler (imblearn)")
+    elif cfg.get("handle_imbalance") == "oversample" and not HAS_IMBLEARN:
+        print(
+            "[Modelling] WARNING: handle_imbalance='oversample' requested "
+            "but imbalanced-learn is not installed. "
+            "Falling back to class_weight strategy."
+        )
 
     results: List[Dict[str, Any]] = []
 
@@ -111,12 +284,21 @@ def train_models(
         if verbose:
             print(f"[Modelling] Training: {name}")
 
-        pipe = Pipeline(steps=[
-            ("preprocess", preprocessor),
-            ("model", model),
-        ])
-        pipe.fit(X_train, y_train)
+        is_dummy = "Dummy" in name
 
+        if use_oversample and not is_dummy:
+            pipe = ImbPipeline(steps=[
+                ("preprocess", preprocessor),
+                ("oversample", RandomOverSampler(random_state=seed)),
+                ("model", model),
+            ])
+        else:
+            pipe = Pipeline(steps=[
+                ("preprocess", preprocessor),
+                ("model", model),
+            ])
+
+        pipe.fit(X_train, y_train)
         y_pred = pipe.predict(X_test)
 
         metrics = {
@@ -137,11 +319,18 @@ def train_models(
             "y_pred": y_pred,
         })
 
-    # Sort by balanced accuracy then macro F1
-    results.sort(key=lambda r: (r["metrics"]["balanced_accuracy"], r["metrics"]["f1_macro"]), reverse=True)
+    # sort: best balanced_accuracy first, then best macro F1 as tiebreak
+    results.sort(
+        key=lambda r: (
+            r["metrics"]["balanced_accuracy"],
+            r["metrics"]["f1_macro"],
+        ),
+        reverse=True,
+    )
 
     return {
         "results": results,
         "best": results[0],
         "all_metrics": [r["metrics"] for r in results],
     }
+

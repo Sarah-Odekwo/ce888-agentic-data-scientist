@@ -131,12 +131,16 @@ class AgenticDataScientist:
         # Look up previous runs for the same dataset fingerprint (memory hint)
         prev = self.memory.get_dataset_record(fp)
         if prev:
-            self.log(f"Memory hit: previously best={prev.get('best_model')} for fp={fp}")
+            self.log(
+                f"Memory hit: previously best={prev.get('best_model')} "
+                f"best_bal_acc={prev.get('best_bal_acc', 'n/a')}  fp={fp}"
+            )
 
         # Create an initial plan informed by the profile and optional memory hint
         plan = create_plan(profile, memory_hint=prev)
-        self.log(f"Plan: {plan}")
+        self.log(f"Plan steps: {len(plan)}")
 
+        # main agentic loop
         # Execution loop: trains and evaluates, then optionally replans and repeats
         while True:
             # Build preprocessing pipeline tailored to the profile
@@ -144,6 +148,7 @@ class AgenticDataScientist:
             # Choose candidate models to try based on the profile
             candidates = select_models(profile, seed=self.ctx.seed)
             self.log(f"Candidate models: {[n for n, _ in candidates]}")
+
 
             # Train candidate models and persist intermediate artefacts
             results = train_models(
@@ -155,6 +160,7 @@ class AgenticDataScientist:
                 test_size=self.ctx.test_size,
                 output_dir=self.ctx.output_dir,
                 verbose=self.verbose,
+                config=profile.get("_plan_config", {}),
             )
 
             # Evaluate the trained models and pick the best one
@@ -165,6 +171,13 @@ class AgenticDataScientist:
                 dataset_profile=profile,
                 evaluation=eval_payload["best_metrics"],
                 all_metrics=eval_payload["all_metrics"],
+            )
+
+            self.log(
+                f"Reflection: status={reflection['status']}  "
+                f"bal_acc={reflection['bal_acc']:.3f}  "
+                f"severity={reflection['severity_counts']}  "
+                f"replan={reflection['replan_recommended']}"
             )
 
             # Persist core run artefacts for later review
@@ -182,6 +195,7 @@ class AgenticDataScientist:
                 plan=plan,
                 eval_payload=eval_payload,
                 reflection=reflection,
+                memory_summary=self.memory.get_summary(fp),
             )
 
             # Update the memory store with outcomes from this run
@@ -193,14 +207,22 @@ class AgenticDataScientist:
                 "best_metrics": eval_payload["best_metrics"],
             })
 
+            self.memory.log_run(fp, {                               # ← CHANGE 3
+                "run_id":       self.ctx.run_id,
+                "plan_config":  profile.get("_plan_config", {}),
+                "reflection":   reflection,
+                "replan_count": self.state["replan_count"],
+            })
+
+
             # Decide whether the agent should attempt to re-plan and re-run
             if not should_replan(reflection):
-                # No replan suggested — finish the run
+                self.log("Reflection: no replan needed - finishing run.")
                 break
 
             # If we've already replanned the allowed number of times, stop
             if self.state["replan_count"] >= self.ctx.max_replans:
-                self.log("Replan suggested, but max_replans reached. Stopping.")
+                self.log(f"Replan suggested, but max_replans={self.ctx.max_replans} reached. Stopping.")
                 break
 
             # Otherwise, increment replan counter and apply the replan strategy
