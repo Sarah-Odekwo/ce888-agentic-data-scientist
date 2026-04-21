@@ -3,12 +3,14 @@ import json
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.metrics import confusion_matrix, classification_report
+from scipy.stats import ttest_rel
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix, classification_report, balanced_accuracy_score
 
 # helper functions
 
@@ -39,14 +41,81 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str, titl
                 fontsize=10,
             )
 
-    ax.set_ylabel("True label",      fontsize=10)
+    ax.set_ylabel("True label", fontsize=10)
     ax.set_xlabel("Predicted label", fontsize=10)
     plt.tight_layout()
     plt.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close()
+    
+# significance test
+def significance_test(
+    results: List[Dict[str, Any]],
+    X_data:pd.DataFrame,
+    y_data: pd.Series,
+    seed: int = 42,
+    n_splits: int = 5,
+) -> Dict[str, Any]:
+    """
+    Paired t-test comparing the best model vs every other candidate
+    across n_splits cross-validation folds.
+    """
+    non_dummy = [r for r in results if "Dummy" not in r["name"]]
+    if len(non_dummy) < 2:
+        return {"skipped": True, "reason": "Fewer than 2 non-dummy models available."}
 
+    best = non_dummy[0]
+    best_name = best["name"]
 
-def evaluate_best(training_payload: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    # collect best model fold scores once
+    best_scores: List[float] = []
+    for tr_idx, te_idx in skf.split(X_data, y_data):
+        X_tr, X_te = X_data.iloc[tr_idx], X_data.iloc[te_idx]
+        y_tr, y_te = y_data.iloc[tr_idx], y_data.iloc[te_idx]
+        try:
+            best["pipeline"].fit(X_tr, y_tr)
+            best_scores.append(balanced_accuracy_score(y_te, best["pipeline"].predict(X_te)))
+        except Exception:
+            best_scores.append(0)
+
+    # compare each other model against the best
+    comparisons: Dict[str, Any] = {}
+    for r in non_dummy[1:]:
+        other_scores: List[float] = []
+        for tr_idx, te_idx in skf.split(X_data, y_data):
+            X_tr, X_te = X_data.iloc[tr_idx], X_data.iloc[te_idx]
+            y_tr, y_te = y_data.iloc[tr_idx], y_data.iloc[te_idx]
+            try:
+                r["pipeline"].fit(X_tr, y_tr)
+                other_scores.append(float(balanced_accuracy_score(y_te, r["pipeline"].predict(X_te))))
+            except Exception:
+                other_scores.append(0)
+            
+
+        t_stat, p_value = ttest_rel(best_scores, other_scores)
+        significant = bool(p_value < 0.05)
+
+        comparisons[r["name"]] = {
+            "t_stat": round(float(t_stat),  4),
+            "p_value": round(float(p_value), 4),
+            "significant": significant,
+            "interpretation": (
+                f"{best_name} is significantly better than {r['name']} (p={p_value:.3f}, t={t_stat:.3f})"
+                if significant
+                else
+                f"No significant difference between {best_name} and {r['name']} (p={p_value:.3f}) — simpler model may be enough"
+            ),
+        }
+
+    return {
+        "best_model": best_name,
+        "alpha": 0.05,
+        "n_folds": n_splits,
+        "comparisons": comparisons,
+    }
+
+def evaluate_best(training_payload: Dict[str, Any], output_dir: str, seed: int=42) -> Dict[str, Any]:
     """
     Compute evaluation artefacts for the best model.
 
@@ -55,9 +124,11 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str) -> Dict[str
         all_metrics : list of metric dicts for all candidates
         confusion_matrix_path : path to the saved PNG
         classification_report : sklearn text report string
+        significance_test: dict
     """
-    best       = training_payload["best"]
+    best = training_payload["best"]
     all_metrics= training_payload["all_metrics"]
+    results = training_payload.get("results", [])
 
     y_test = best["y_test"]
     y_pred = best["y_pred"]
@@ -66,16 +137,32 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str) -> Dict[str
     labels = sorted([str(x) for x in y_test.dropna().unique().tolist()])
     cm_path= os.path.join(output_dir, "confusion_matrix.png")
     plot_confusion_matrix(cm, labels, cm_path, f"Confusion Matrix: {best['name']}")
-
+    
     cls_report = classification_report(y_test, y_pred, zero_division=0)
+
+    X_test = best.get("X_test", pd.DataFrame())
+    if not X_test.empty and len(results) >= 2:
+        min_class_count = int(y_test.value_counts().min())
+        safe_splits = min(5, len(y_test), min_class_count)
+
+        if safe_splits < 2 or len(results) < 2:
+            sig = {"skipped": True, "reason": f"Too few samples per class for cross-validation (min class size={min_class_count})."}
+        else:
+            sig = significance_test(
+                results=results,
+                X_data=X_test,
+                y_data=y_test,
+                seed=seed,
+                n_splits=safe_splits,
+    )
 
     return {
         "best_metrics": best["metrics"],
         "all_metrics": all_metrics,
         "confusion_matrix_path": cm_path,
         "classification_report": cls_report,
+        "significance_test": sig,
     }
-
 
 
 def write_markdown_report(
@@ -86,7 +173,8 @@ def write_markdown_report(
     plan: List[str],
     eval_payload: Dict[str, Any],
     reflection: Dict[str, Any],
-    memory_summary:  Optional[Dict[str, Any]] = None,
+    memory_summary: Optional[Dict[str, Any]] = None,
+    plan_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Write a Markdown report to out_path.
@@ -98,6 +186,7 @@ def write_markdown_report(
             Pass as: memory_summary=self.memory.get_summary(fp)
     """
     best = eval_payload["best_metrics"]
+    all_metrics = eval_payload.get("all_metrics", [])
 
     def short_list(xs: List[str], n: int = 12) -> str:
         return ", ".join(xs[:n]) + (" …" if len(xs) > n else "")
@@ -105,94 +194,110 @@ def write_markdown_report(
     numeric = dataset_profile.get("feature_types", {}).get("numeric",     [])
     categorical = dataset_profile.get("feature_types", {}).get("categorical", [])
     notes = dataset_profile.get("notes", [])
-    cfg = dataset_profile.get("_plan_config", {})
 
-    # section helper functions
+    # planning decisions table
+    plan_config_section = ""
+    if plan_config:
+        rows = []
+        field_labels = [
+            ("impute_strategy",    "Imputer"),
+            ("scaler",             "Scaler"),
+            ("handle_imbalance",   "Imbalance handling"),
+            ("high_card_cols",     "High-card cols → OrdinalEncoder"),
+            ("drop_corr_cols",     "Correlated cols dropped"),
+            ("feature_selection",  "Feature selection"),
+            ("select_k",           "SelectKBest k"),
+            ("primary_metric",     "Primary metric"),
+        ]
+        for key, label in field_labels:
+            val = plan_config.get(key)
+            if val is not None:
+                rows.append(f"| {label} | `{val}` |")
+        if rows:
+            plan_config_section = (
+                "## Planning Decisions\n\n"
+                "| Decision | Value |\n"
+                "|---|---|\n"
+                + "\n".join(rows)
+                + "\n\n\n---\n"
+            )
 
-    def _plan_config_section(cfg: Dict[str, Any]) -> str:
-        if not cfg:
-            return "_No _plan_config found - planner may not have run._\n"
-        rows_md = []
-        label_map = {
-            "impute_strategy": "Imputer",
-            "scaler": "Scaler",
-            "handle_imbalance": "Imbalance handling",
-            "high_card_cols": "High-card cols → OrdinalEncoder",
-            "drop_corr_cols": "Correlated cols dropped",
-            "feature_selection": "Feature selection",
-            "k_best": "SelectKBest k",
-            "primary_metric": "Primary metric",
-            "priority_model": "Priority model (from memory)",
-            "extra_models": "Extra models added (replan)",
-            "prefer_simple_models": "Prefer simple models",
-        }
-        for key, label in label_map.items():
-            val = cfg.get(key)
-            if val is not None and val != [] and val is not False:
-                rows_md.append(f"| {label} | `{val}` |")
-        if not rows_md:
-            return "_All defaults used._\n"
-        header = "| Decision | Value |\n|---|---|\n"
-        return header + "\n".join(rows_md) + "\n"
+    # significance test 
+    sig      = eval_payload.get("significance_test", {})
+    sig_body = ""
 
-    def _reflection_issues_section(reflection: Dict[str, Any]) -> str:
+    if sig.get("skipped"):
+        sig_body = f"_Skipped: {sig.get('reason', 'n/a')}_"
+    elif sig:
+        best_model = sig.get("best_model", "—")
+        n_folds    = sig.get("n_folds", 5)
+        alpha      = sig.get("alpha", 0.05)
+        header     = (
+            f"**Best model:** `{best_model}` | "
+            f"**α = {alpha}** | **{n_folds}-fold stratified CV**\n\n"
+            "| Comparison Model | t-stat | p-value | Significant? | Interpretation |\n"
+            "|---|---|---|---|---|\n"
+        )
+        table_rows = []
+        for model_name, res in sig.get("comparisons", {}).items():
+            marker = "Yes" if res["significant"] else "No"
+            interp = res.get("interpretation", "")
+            table_rows.append(
+                f"| {model_name} | {res['t_stat']:+.3f} | "
+                f"{res['p_value']:.3f} | {marker} | {interp} |"
+            )
+        sig_body = header + "\n".join(table_rows) if table_rows else "_No comparisons available._"
+
+    # reflection 
+    if reflection:
+        sev = reflection.get("severity_counts", {})
+        high_n = sev.get("HIGH", 0)
+        med_n = sev.get("MEDIUM", 0)
+        low_n = sev.get("LOW", 0)
+        spread = reflection.get("score_spread", 0.0)
+        improvement = reflection.get("improvement_over_dummy", 0.0)
+        replan_flag = reflection.get("replan_recommended", False)
         issues = reflection.get("issues", [])
         suggestions = reflection.get("suggestions", [])
-        severity = reflection.get("severity_counts", {})
-        spread = reflection.get("score_spread")
-        baseline = reflection.get("baseline_improvement")
-        replan = reflection.get("replan_recommended", False)
 
-        lines = []
+        issues_md = "\n".join([f"- {i}" for i in issues]) if issues else "- (none)"
+        sugg_md = "\n".join([f"- {s}" for s in suggestions]) if suggestions else "- (none)"
 
-        # severity summary bar
-        h = severity.get("high", 0)
-        m = severity.get("medium", 0)
-        l = severity.get("low", 0)
-        lines.append(
-            f"**Severity counts:** HIGH={h}  MEDIUM={m}  LOW={l}"
+        reflection_section = (
+            "## Reflection & Diagnosis\n\n"
+            f"**Severity counts:** HIGH={high_n}  MEDIUM={med_n}  LOW={low_n}\n"
+            f"**Score spread across candidates:** {spread:.3f}\n"
+            f"**Improvement over dummy baseline:** {improvement:.3f}\n"
+            f"**Replan triggered:** {'Yes' if replan_flag else 'No'}\n\n"
+            "### Issues found\n"
+            f"{issues_md}\n\n"
+            "### Suggestions\n"
+            f"{sugg_md}\n"
         )
-        if spread is not None:
-            lines.append(f"**Score spread across candidates:** {spread:.3f}")
-        if baseline is not None:
-            lines.append(
-                f"**Improvement over dummy baseline:** {baseline:.3f}"
-            )
-        lines.append(
-            f"**Replan triggered:** {'Yes' if replan else 'No'}"
+    else:
+        reflection_section = "## Reflection & Diagnosis\n\n- (none)\n"
+
+    # memory history
+    if memory_summary and memory_summary.get("run_count", 0) > 0:
+        mem_section = (
+            "## Memory History\n\n"
+            f"| Property | Value |\n"
+            f"|---|---|\n"
+            f"| Total runs on this dataset | **{memory_summary['run_count']}** |\n"
+            f"| Best model ever | **{memory_summary.get('best_model', '—')}** |\n"
+            f"| Best balanced accuracy | **{float(memory_summary.get('best_bal_acc', 0)):.3f}** |\n"
+            f"| Latest balanced accuracy | **{float(memory_summary.get('latest_bal_acc', 0)):.3f}** |\n"
+            f"| Score trend | **{memory_summary.get('score_trend', '—')}** |\n"
+            f"| Replan rate | **{memory_summary.get('replan_rate', 0):.0%}** |\n"
+            f"| Avg issues per run | **{memory_summary.get('avg_n_issues', 0):.1f}** |\n"
         )
-        lines.append("")
+    else:
+        mem_section = "## Memory History\n\n_No prior runs recorded for this dataset._\n"
 
-        if issues:
-            lines.append("### Issues found")
-            for iss in issues:
-                lines.append(f"- {iss}")
-            lines.append("")
 
-        if suggestions:
-            lines.append("### Suggestions")
-            for sug in suggestions:
-                lines.append(f"- {sug}")
+    all_cand_block = json.dumps(all_metrics, indent=2)
 
-        return "\n".join(lines) + "\n"
-
-    def _memory_section(ms: Dict[str, Any]) -> str:
-        if not ms or ms.get("run_count", 0) == 0:
-            return "_No prior runs recorded for this dataset._\n"
-        trend_emoji = {
-            "improving": "📈", "stable": "➡️",
-            "degrading": "📉", "single_run": "🔵",
-        }.get(ms.get("score_trend", ""), "")
-        return (
-            f"| Metric | Value |\n|---|---|\n"
-            f"| Total runs | `{ms['run_count']}` |\n"
-            f"| Best model ever | `{ms.get('best_model', 'n/a')}` |\n"
-            f"| Best balanced_accuracy ever | `{ms.get('best_bal_acc', 0):.3f}` |\n"
-            f"| Score trend | {trend_emoji} `{ms.get('score_trend', 'n/a')}` |\n"
-            f"| Replan rate | `{ms.get('replan_rate', 0):.0%}` of runs |\n"
-            f"| Avg issues per run | `{ms.get('avg_n_issues', 0)}` |\n"
-        )
-
+   
     # assemble markdown
     md = f"""# Agentic Data Scientist - Run Report
 
@@ -211,7 +316,7 @@ def write_markdown_report(
 | Rows | **{dataset_profile["shape"]["rows"]}** |
 | Columns | **{dataset_profile["shape"]["cols"]}** |
 | Task | **{"Classification" if dataset_profile.get("is_classification") else "Regression"}** |
-| Imbalance ratio | **{dataset_profile.get("imbalance_ratio", "n/a")}** |
+| Imbalance ratio | **{dataset_profile.get("imbalance_ratio", "N/A")}** |
 | Total missing % | **{dataset_profile.get("total_missing_pct", 0):.1f}%** |
 | Outlier columns | `{dataset_profile.get("outlier_cols", [])}` |
 | High-card columns | `{dataset_profile.get("high_card_cols", [])}` |
@@ -225,11 +330,7 @@ def write_markdown_report(
 
 ---
 
-## Planning Decisions
-
-{_plan_config_section(cfg)}
-
----
+{plan_config_section}
 
 ## Execution Plan
 
@@ -252,7 +353,7 @@ def write_markdown_report(
 ### All Candidates
 
 ```json
-{json.dumps(eval_payload.get("all_metrics", []), indent=2)}
+{all_cand_block}
 ```
 
 ### Classification Report
@@ -260,27 +361,27 @@ def write_markdown_report(
 ```
 {eval_payload.get("classification_report", "(not available)")}
 ```
+---
+
+## Statistical Significance Test
+
+{sig_body}
 
 ---
 
-## Reflection & Diagnosis
-
-{_reflection_issues_section(reflection)}
+{reflection_section}
 
 ---
 
-## Memory History
-
-{_memory_section(memory_summary) if memory_summary is not None else "_memory_summary not passed to this report — add memory_summary=self.memory.get_summary(fp) in agentic_data_scientist.py._"}
+{mem_section}
 
 ---
 
 ## Artefacts
 
-- Confusion matrix: `{eval_payload.get("confusion_matrix_path", "n/a")}`
+- Confusion matrix: `{eval_payload.get("confusion_matrix_path")}`
 - Report: `{out_path}`
 """
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)
-

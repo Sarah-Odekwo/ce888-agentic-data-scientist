@@ -7,9 +7,10 @@ import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import (OneHotEncoder, OrdinalEncoder, StandardScaler, RobustScaler,)
+from sklearn.preprocessing import (OneHotEncoder, OrdinalEncoder, StandardScaler, RobustScaler)
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
 
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
@@ -17,6 +18,7 @@ from sklearn.ensemble import (
     RandomForestClassifier,
     GradientBoostingClassifier,
     ExtraTreesClassifier,
+    VotingClassifier
 )
 from sklearn.svm import SVC
 
@@ -31,7 +33,7 @@ from sklearn.metrics import (
 # optional: imbalanced-learn for oversampling (replan strategy)
 try:
     from imblearn.pipeline import Pipeline as ImbPipeline
-    from imblearn.over_sampling import RandomOverSampler
+    from imblearn.over_sampling import RandomOverSampler, SMOTE
     HAS_IMBLEARN = True
 except ImportError:
     HAS_IMBLEARN = False
@@ -76,8 +78,13 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     high_card_active = [c for c in high_card_cols if c in cat_cols]
     low_card_cols    = [c for c in cat_cols if c not in high_card_active]
 
+    # choose the imputer
     # choose the scaler based on _plan_config
     # RobustScaler used when data_profiler detected outlier columns so that extreme values do not distort the scaling of the inlier range.
+    if impute_strategy == "knn":
+        num_imputer = KNNImputer(n_neighbors=5)
+    else:
+        num_imputer = SimpleImputer(strategy=impute_strategy if impute_strategy in ("mean", "median") else "median")
     scaler = (
         RobustScaler()
         if scaler_type == "robust"
@@ -86,7 +93,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
 
     # numeric transformer
     numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy=impute_strategy)),
+        ("imputer", num_imputer),
         ("scaler",  scaler),
     ])
 
@@ -121,7 +128,6 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         transformers.append(("cat_high", high_card_transformer, high_card_active))
 
     if not transformers:
-        # Fallback: passthrough everything
         transformers.append(("num", numeric_transformer, num_cols or list(
             profile["feature_types"]["numeric"]
         )))
@@ -129,15 +135,14 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     ct = ColumnTransformer(transformers=transformers, remainder="drop")
 
     # optionally append SelectKBest
-    # Planner activates this when >100 effective features exist, or when the reflector triggers a replan due to noisy/high-spread results.
+    # planner activates this when >100 effective features exist, or when the reflector triggers a replan due to high-spread results.
     if feature_selection == "select_k_best":
         return Pipeline(steps=[
             ("preprocess", ct),
-            ("select",     SelectKBest(f_classif, k=k_best)),
+            ("select", SelectKBest(f_classif, k=k_best)),
         ])
 
     return ct
-
 
 def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, Any]]:
     """
@@ -146,10 +151,10 @@ def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, An
     Reads from profile["_plan_config"]:
         handle_imbalance : "class_weight" | "oversample" | None
             - class_weight="balanced" when "class_weight"
-            - class_weight=None when "oversample" 
+            - class_weight=None when "oversample" or "smote"
         extra_models : List[str]  — added by reflector on replan
-            supported: "ExtraTreesClassifier"
-        priority_model    : str | None — from memory hint (best past model)
+            supported: "ExtraTreesClassifier", "VotingEnsemble", "CalibratedClassifier"
+        priority_model : str | None — from memory hint (best past model)
             - moved to front of candidate list (trained first)
         prefer_simple_models : bool — set for small datasets (<500 rows)
             - skips GradientBoosting and SVC
@@ -175,8 +180,7 @@ def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, An
             max_iter=2000, class_weight=class_weight, random_state=seed,
         )),
         ("RandomForest", RandomForestClassifier(
-            n_estimators=300, random_state=seed,
-            n_jobs=-1, class_weight=class_weight,
+            n_estimators=300, random_state=seed, n_jobs=-1, class_weight=class_weight,
         )),
     ]
     
@@ -191,8 +195,17 @@ def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, An
     # extra models from reflector replan 
     extra_map: Dict[str, Any] = {
         "ExtraTreesClassifier": ExtraTreesClassifier(
-            n_estimators=300, random_state=seed,
-            n_jobs=-1, class_weight=class_weight,
+            n_estimators=300, random_state=seed, n_jobs=-1, class_weight=class_weight,
+        ),
+        "VotingEnsemble": VotingClassifier(
+            estimators=[
+                ("rf", RandomForestClassifier(n_estimators=200, random_state=seed, n_jobs=-1, class_weight=class_weight)),
+                ("gb", GradientBoostingClassifier(n_estimators=200, random_state=seed)),
+            ],
+            voting="soft",
+        ),
+        "CalibratedClassifier": CalibratedClassifierCV(
+            RandomForestClassifier(n_estimators=200, random_state=seed, n_jobs=-1, class_weight=class_weight), cv=3, method="isotonic",
         ),
     }
     existing_names = {name for name, _ in candidates}
@@ -235,11 +248,9 @@ def train_models(
     Parameters: 
         config : optional _plan_config dict from the profile.
             When config["handle_imbalance"] == "oversample" AND imbalanced-learn
-            is installed, a RandomOverSampler is inserted into the pipeline
+            is installed, a resampler is inserted into the pipeline
             between preprocessing and the model so the training set is
-            synthetically balanced.  The resampler is skipped during predict().
-            If imbalanced-learn is not installed, falls back silently (the
-            class_weight strategy set in select_models() still applies).
+            synthetically balanced. If imbalanced-learn is not installed, falls back silently.
     """
     cfg = config or {}
 
@@ -265,16 +276,16 @@ def train_models(
         stratify=stratify,
     )
 
-    # Oversampling: only for non-dummy models when imblearn is available
-    use_oversample = (
-        cfg.get("handle_imbalance") == "oversample" and HAS_IMBLEARN
-    )
-    if use_oversample and verbose:
-        print("[Modelling] Oversampling strategy: RandomOverSampler (imblearn)")
-    elif cfg.get("handle_imbalance") == "oversample" and not HAS_IMBLEARN:
+    # oversampling: either oversample using RandomOverSampler or SMOTE
+    imbalance_strategy = cfg.get("handle_imbalance", "")
+    use_resample = imbalance_strategy in ("oversample", "smote") and HAS_IMBLEARN
+
+    if use_resample and verbose:
+        sampler_name = "SMOTE" if imbalance_strategy == "smote" else "RandomOverSampler"
+        print(f"[Modelling] Oversampling strategy: {sampler_name} (imblearn)")
+    elif imbalance_strategy in ("oversample", "smote") and not HAS_IMBLEARN:
         print(
-            "[Modelling] WARNING: handle_imbalance='oversample' requested "
-            "but imbalanced-learn is not installed. "
+            f"[Modelling] WARNING: handle_imbalance='{imbalance_strategy}' requested but imbalanced-learn is not installed. "
             "Falling back to class_weight strategy."
         )
 
@@ -286,10 +297,14 @@ def train_models(
 
         is_dummy = "Dummy" in name
 
-        if use_oversample and not is_dummy:
+        if use_resample and not is_dummy:
+            resampler = (
+                SMOTE(random_state=seed)
+                if imbalance_strategy == "smote" else RandomOverSampler(random_state=seed)
+            )
             pipe = ImbPipeline(steps=[
                 ("preprocess", preprocessor),
-                ("oversample", RandomOverSampler(random_state=seed)),
+                ("oversample", resampler),
                 ("model", model),
             ])
         else:
@@ -298,8 +313,13 @@ def train_models(
                 ("model", model),
             ])
 
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
+        try:
+            pipe.fit(X_train, y_train)
+            y_pred = pipe.predict(X_test)
+        except Exception as exc:
+            if verbose:
+                print(f"[Modelling] SKIP {name}: {exc}")
+            continue
 
         metrics = {
             "model": name,
@@ -318,6 +338,9 @@ def train_models(
             "y_test": y_test,
             "y_pred": y_pred,
         })
+
+    if not results:
+        raise RuntimeError("All model candidates failed during training.")
 
     # sort: best balanced_accuracy first, then best macro F1 as tiebreak
     results.sort(

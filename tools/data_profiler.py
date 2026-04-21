@@ -10,7 +10,7 @@ CORR_THRESHOLD = 0.9 # pearson correlation above which two columns are correlate
 
 
 def infer_target_column(df: pd.DataFrame) -> Optional[str]:
-    """
+    """  
     Heuristic target inference:
       - prefer common target-like column names
       - else last column if it has relatively low cardinality

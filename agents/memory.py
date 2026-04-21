@@ -61,8 +61,7 @@ class JSONMemory:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-
-            # merge: this ensures that the new top-level keys exist in older files
+            # merge: ensures new top-level keys exist in older files
             self.data["datasets"] = loaded.get("datasets", {})
             self.data["run_history"] = loaded.get("run_history", [])
             self.data["notes"] = loaded.get("notes", [])
@@ -70,13 +69,13 @@ class JSONMemory:
             backup = self.path + ".bak"
             shutil.copy(self.path, backup)
             self.data = {
-                "datasets":    {},
+                "datasets": {},
                 "run_history": [],
                 "notes": [{
-                    "ts":  now_iso(),
-                    "msg": f"Memory reset after corrupt read; backup at {backup}",
-                }],
-            }
+                    "ts": now_iso(), 
+                    "msg": f"Memory reset; backup at {backup}"
+                    }]
+                }
 
     def save(self) -> None:
         """Write memory to disk atomically (write-then-rename)."""
@@ -96,7 +95,7 @@ class JSONMemory:
         """
         return self.data.get("datasets", {}).get(fingerprint)
 
-    def upsert_dataset_record(self, fingerprint: str, record: Dict[str, Any]) -> None:
+    def upsert_dataset_record(self, fingerprint, record, run_id: Optional[str] = None) -> None:
         """
         Update the dataset record, keeping best-ever metrics.
 

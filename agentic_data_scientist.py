@@ -18,6 +18,9 @@ from tools.data_profiler import profile_dataset, infer_target_column, dataset_fi
 from tools.modelling import build_preprocessor, select_models, train_models
 from tools.evaluation import evaluate_best, write_markdown_report, save_json
 
+# common placeholder strings used across real-world datasets to represent missing values
+_EXTRA_NA_VALUES = ["?", "??", "NA", "N/A", "n/a", "na", "null", "NULL", "None", "none", "-", "--", ""]
+
 
 # Lightweight container for run metadata and parameters
 @dataclass
@@ -66,10 +69,29 @@ class AgenticDataScientist:
             print(f"[AgenticDataScientist] {msg}")
 
     def load_data(self, path: str) -> pd.DataFrame:
-        """Load a CSV into a pandas DataFrame and log its shape."""
+        """
+        Load a CSV into a DataFrame. Handles:
+        - Semicolon-delimited files
+        - Non-standard missing value markers
+        - Leading/trailing whitespace in column names and string values
+        """
         self.log(f"Loading dataset: {path}")
-        df = pd.read_csv(path)
-        self.log(f"Loaded {df.shape[0]} rows × {df.shape[1]} cols")
+
+        # detect delimiter by checking the first line of the file
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            first_line = f.readline()
+        sep = ";" if first_line.count(";") > first_line.count(",") else ","
+
+        df = pd.read_csv(path, sep=sep, na_values=_EXTRA_NA_VALUES, keep_default_na=True)
+
+        # strip whitespace from column names
+        df.columns = df.columns.str.strip()
+
+        # strip whitespace from string column values
+        str_cols = df.select_dtypes(include="object").columns
+        df[str_cols] = df[str_cols].apply(lambda col: col.str.strip())
+
+        self.log(f"Loaded {df.shape[0]} rows x {df.shape[1]} cols | sep='{sep}'")
         return df
 
     def run(
@@ -207,12 +229,23 @@ class AgenticDataScientist:
                 "best_metrics": eval_payload["best_metrics"],
             })
 
-            self.memory.log_run(fp, {                               # ← CHANGE 3
+            self.memory.log_run(fp, {                              
                 "run_id":       self.ctx.run_id,
                 "plan_config":  profile.get("_plan_config", {}),
                 "reflection":   reflection,
                 "replan_count": self.state["replan_count"],
             })
+
+            write_markdown_report(                     
+                out_path=os.path.join(self.ctx.output_dir, "report.md"),
+                ctx=self.ctx,
+                fingerprint=fp,
+                dataset_profile=profile,
+                plan=plan,
+                eval_payload=eval_payload,
+                reflection=reflection,
+                memory_summary=self.memory.get_summary(fp),  
+            )
 
 
             # Decide whether the agent should attempt to re-plan and re-run

@@ -141,7 +141,7 @@ def create_plan(
             f"(IQRx3 detection in data_profiler.py) -> RobustScaler (scales by median and IQR; extreme values do not distort the scaling of the inlier range the way that StandardScaler would)."
         )
     else:
-        confif["scaler"] = "standard"
+        config["scaler"] = "standard"
         plan.append(
             f"[scale_features] No outlier columns detected -> StandardScaler (zero-mean, unit-variance; optimal for linear models and distance-based algorithms when the data is well-behaved)."
         )
